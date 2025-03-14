@@ -241,6 +241,7 @@ InvalidDocumentGeoField               , InvalidRequest       , BAD_REQUEST ;
 InvalidVectorDimensions               , InvalidRequest       , BAD_REQUEST ;
 InvalidVectorsType                    , InvalidRequest       , BAD_REQUEST ;
 InvalidDocumentId                     , InvalidRequest       , BAD_REQUEST ;
+InvalidDocumentIds                    , InvalidRequest       , BAD_REQUEST ;
 InvalidDocumentLimit                  , InvalidRequest       , BAD_REQUEST ;
 InvalidDocumentOffset                 , InvalidRequest       , BAD_REQUEST ;
 InvalidSearchEmbedder                 , InvalidRequest       , BAD_REQUEST ;
@@ -281,6 +282,7 @@ InvalidSearchCropMarker               , InvalidRequest       , BAD_REQUEST ;
 InvalidSearchFacets                   , InvalidRequest       , BAD_REQUEST ;
 InvalidSearchSemanticRatio            , InvalidRequest       , BAD_REQUEST ;
 InvalidSearchLocales                  , InvalidRequest       , BAD_REQUEST ;
+InvalidFacetSearchExhaustiveFacetCount, InvalidRequest       , BAD_REQUEST ;
 InvalidFacetSearchFacetName           , InvalidRequest       , BAD_REQUEST ;
 InvalidSimilarId                      , InvalidRequest       , BAD_REQUEST ;
 InvalidSearchFilter                   , InvalidRequest       , BAD_REQUEST ;
@@ -405,7 +407,7 @@ impl ErrorCode for milli::Error {
                 match error {
                     // TODO: wait for spec for new error codes.
                     UserError::SerdeJson(_)
-                    | UserError::InvalidLmdbOpenOptions
+                    | UserError::EnvAlreadyOpened
                     | UserError::DocumentLimitReached
                     | UserError::UnknownInternalDocumentId { .. } => Code::Internal,
                     UserError::InvalidStoreFile => Code::InvalidStoreFile,
@@ -502,8 +504,7 @@ impl ErrorCode for HeedError {
             HeedError::Mdb(_)
             | HeedError::Encoding(_)
             | HeedError::Decoding(_)
-            | HeedError::DatabaseClosing
-            | HeedError::BadOpenOptions { .. } => Code::Internal,
+            | HeedError::EnvAlreadyOpened => Code::Internal,
         }
     }
 }
