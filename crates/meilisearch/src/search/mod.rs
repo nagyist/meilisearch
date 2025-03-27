@@ -340,7 +340,8 @@ impl SearchKind {
         vector_len: Option<usize>,
         route: Route,
     ) -> Result<(String, Arc<Embedder>, bool), ResponseError> {
-        let embedder_configs = index.embedding_configs(&index.read_txn()?)?;
+        let rtxn = index.read_txn()?;
+        let embedder_configs = index.embedding_configs(&rtxn)?;
         let embedders = index_scheduler.embedders(index_uid, embedder_configs)?;
 
         let (embedder, _, quantized) = embedders
@@ -635,7 +636,7 @@ impl SearchQueryWithIndex {
 pub struct SimilarQuery {
     #[deserr(error = DeserrJsonError<InvalidSimilarId>)]
     #[schema(value_type = String)]
-    pub id: ExternalDocumentId,
+    pub id: serde_json::Value,
     #[deserr(default = DEFAULT_SEARCH_OFFSET(), error = DeserrJsonError<InvalidSimilarOffset>)]
     pub offset: usize,
     #[deserr(default = DEFAULT_SEARCH_LIMIT(), error = DeserrJsonError<InvalidSimilarLimit>)]
@@ -657,8 +658,7 @@ pub struct SimilarQuery {
     pub ranking_score_threshold: Option<RankingScoreThresholdSimilar>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserr)]
-#[deserr(try_from(Value) = TryFrom::try_from -> InvalidSimilarId)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExternalDocumentId(String);
 
 impl AsRef<str> for ExternalDocumentId {
@@ -674,7 +674,7 @@ impl ExternalDocumentId {
 }
 
 impl TryFrom<String> for ExternalDocumentId {
-    type Error = InvalidSimilarId;
+    type Error = milli::UserError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         serde_json::Value::String(value).try_into()
@@ -682,10 +682,10 @@ impl TryFrom<String> for ExternalDocumentId {
 }
 
 impl TryFrom<Value> for ExternalDocumentId {
-    type Error = InvalidSimilarId;
+    type Error = milli::UserError;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        Ok(Self(milli::documents::validate_document_id_value(value).map_err(|_| InvalidSimilarId)?))
+        Ok(Self(milli::documents::validate_document_id_value(value)?))
     }
 }
 
@@ -916,7 +916,7 @@ fn prepare_search<'t>(
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 
                     embedder
-                        .embed_search(query.q.clone().unwrap(), Some(deadline))
+                        .embed_search(query.q.as_ref().unwrap(), Some(deadline))
                         .map_err(milli::vector::Error::from)
                         .map_err(milli::Error::from)?
                 }
@@ -1597,6 +1597,11 @@ pub fn perform_similar(
         show_ranking_score_details,
         ranking_score_threshold,
     } = query;
+
+    let id: ExternalDocumentId = id.try_into().map_err(|error| {
+        let msg = format!("Invalid value at `.id`: {error}");
+        ResponseError::from_msg(msg, Code::InvalidSimilarId)
+    })?;
 
     // using let-else rather than `?` so that the borrow checker identifies we're always returning here,
     // preventing a use-after-move
