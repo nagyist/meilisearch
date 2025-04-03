@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 
 use bumpalo::Bump;
-use heed::RoTxn;
+use heed::{RoTxn, WithoutTls};
 use rayon::iter::IndexedParallelIterator;
 
 use super::super::document_change::DocumentChange;
@@ -28,7 +28,7 @@ pub struct DocumentChangeContext<
     /// inside of the DB.
     pub db_fields_ids_map: &'indexer FieldsIdsMap,
     /// A transaction providing data from the DB before all indexing operations
-    pub rtxn: RoTxn<'indexer>,
+    pub rtxn: RoTxn<'indexer, WithoutTls>,
 
     /// Global field id map that is up to date with the current state of the indexing process.
     ///
@@ -149,16 +149,11 @@ pub struct IndexingContext<
     pub grenad_parameters: &'indexer GrenadParameters,
 }
 
-impl<
-        'fid,     // invariant lifetime of fields ids map
-        'indexer, // covariant lifetime of objects that are borrowed  during the entire indexing operation
-        'index,   // covariant lifetime of the index
-        MSP,
-    > Copy
+impl<MSP> Copy
     for IndexingContext<
-        'fid,     // invariant lifetime of fields ids map
-        'indexer, // covariant lifetime of objects that are borrowed  during the entire indexing operation
-        'index,   // covariant lifetime of the index
+        '_, // invariant lifetime of fields ids map
+        '_, // covariant lifetime of objects that are borrowed  during the entire indexing operation
+        '_, // covariant lifetime of the index
         MSP,
     >
 where
@@ -166,16 +161,11 @@ where
 {
 }
 
-impl<
-        'fid,     // invariant lifetime of fields ids map
-        'indexer, // covariant lifetime of objects that are borrowed  during the entire indexing operation
-        'index,   // covariant lifetime of the index
-        MSP,
-    > Clone
+impl<MSP> Clone
     for IndexingContext<
-        'fid,     // invariant lifetime of fields ids map
-        'indexer, // covariant lifetime of objects that are borrowed  during the entire indexing operation
-        'index,   // covariant lifetime of the index
+        '_, // invariant lifetime of fields ids map
+        '_, // covariant lifetime of objects that are borrowed  during the entire indexing operation
+        '_, // covariant lifetime of the index
         MSP,
     >
 where

@@ -10,9 +10,10 @@ use super::super::channel::*;
 use crate::documents::PrimaryKey;
 use crate::fields_ids_map::metadata::FieldIdMapWithMetadata;
 use crate::index::IndexEmbeddingConfig;
+use crate::progress::Progress;
 use crate::update::settings::InnerIndexSettings;
 use crate::vector::{ArroyWrapper, Embedder, EmbeddingConfigs, Embeddings};
-use crate::{Error, Index, InternalError, Result};
+use crate::{Error, Index, InternalError, Result, UserError};
 
 pub fn write_to_db(
     mut writer_receiver: WriterBbqueueReceiver<'_>,
@@ -100,7 +101,9 @@ impl ChannelCongestion {
 pub fn build_vectors<MSP>(
     index: &Index,
     wtxn: &mut RwTxn<'_>,
+    progress: &Progress,
     index_embeddings: Vec<IndexEmbeddingConfig>,
+    arroy_memory: Option<usize>,
     arroy_writers: &mut HashMap<u8, (&str, &Embedder, ArroyWrapper, usize)>,
     must_stop_processing: &MSP,
 ) -> Result<()>
@@ -111,10 +114,19 @@ where
         return Ok(());
     }
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let seed = rand::random();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     for (_index, (_embedder_name, _embedder, writer, dimensions)) in arroy_writers {
         let dimensions = *dimensions;
-        writer.build_and_quantize(wtxn, &mut rng, dimensions, false, must_stop_processing)?;
+        writer.build_and_quantize(
+            wtxn,
+            progress,
+            &mut rng,
+            dimensions,
+            false,
+            arroy_memory,
+            must_stop_processing,
+        )?;
     }
 
     index.put_embedding_configs(wtxn, index_embeddings)?;
@@ -206,7 +218,12 @@ pub fn write_from_bbqueue(
                     arroy_writers.get(&embedder_id).expect("requested a missing embedder");
                 let mut embeddings = Embeddings::new(*dimensions);
                 let all_embeddings = asvs.read_all_embeddings_into_vec(frame, aligned_embedding);
-                embeddings.append(all_embeddings.to_vec()).unwrap();
+                if embeddings.append(all_embeddings.to_vec()).is_err() {
+                    return Err(Error::UserError(UserError::InvalidVectorDimensions {
+                        expected: *dimensions,
+                        found: all_embeddings.len(),
+                    }));
+                }
                 writer.del_items(wtxn, *dimensions, docid)?;
                 writer.add_items(wtxn, docid, &embeddings)?;
             }

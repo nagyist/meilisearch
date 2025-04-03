@@ -34,7 +34,8 @@ pub const CONTENT: &str = include_str!("../assets/test_set.ndjson");
 
 pub fn setup_search_index_with_criteria(criteria: &[Criterion]) -> Index {
     let path = tempfile::tempdir().unwrap();
-    let mut options = EnvOpenOptions::new();
+    let options = EnvOpenOptions::new();
+    let mut options = options.read_txn_without_tls();
     options.map_size(10 * 1024 * 1024); // 10 MB
     let index = Index::new(options, &path, true).unwrap();
 
@@ -241,11 +242,11 @@ fn execute_filter(filter: &str, document: &TestDocument) -> Option<String> {
             id = contains_key_rec(opt1, "opt2").then(|| document.id.clone());
         }
     } else if matches!(filter, "opt1 IS NULL" | "NOT opt1 IS NOT NULL") {
-        id = document.opt1.as_ref().map_or(false, |v| v.is_null()).then(|| document.id.clone());
+        id = document.opt1.as_ref().is_some_and(|v| v.is_null()).then(|| document.id.clone());
     } else if matches!(filter, "NOT opt1 IS NULL" | "opt1 IS NOT NULL") {
-        id = document.opt1.as_ref().map_or(true, |v| !v.is_null()).then(|| document.id.clone());
+        id = document.opt1.as_ref().is_none_or(|v| !v.is_null()).then(|| document.id.clone());
     } else if matches!(filter, "opt1.opt2 IS NULL") {
-        if document.opt1opt2.as_ref().map_or(false, |v| v.is_null()) {
+        if document.opt1opt2.as_ref().is_some_and(|v| v.is_null()) {
             id = Some(document.id.clone());
         } else if let Some(opt1) = &document.opt1 {
             if !opt1.is_null() {
@@ -253,15 +254,11 @@ fn execute_filter(filter: &str, document: &TestDocument) -> Option<String> {
             }
         }
     } else if matches!(filter, "opt1 IS EMPTY" | "NOT opt1 IS NOT EMPTY") {
-        id = document.opt1.as_ref().map_or(false, is_empty_value).then(|| document.id.clone());
+        id = document.opt1.as_ref().is_some_and(is_empty_value).then(|| document.id.clone());
     } else if matches!(filter, "NOT opt1 IS EMPTY" | "opt1 IS NOT EMPTY") {
-        id = document
-            .opt1
-            .as_ref()
-            .map_or(true, |v| !is_empty_value(v))
-            .then(|| document.id.clone());
+        id = document.opt1.as_ref().is_none_or(|v| !is_empty_value(v)).then(|| document.id.clone());
     } else if matches!(filter, "opt1.opt2 IS EMPTY") {
-        if document.opt1opt2.as_ref().map_or(false, is_empty_value) {
+        if document.opt1opt2.as_ref().is_some_and(is_empty_value) {
             id = Some(document.id.clone());
         }
     } else if matches!(
