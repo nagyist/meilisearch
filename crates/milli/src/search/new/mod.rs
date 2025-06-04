@@ -22,10 +22,13 @@ mod vector_sort;
 mod tests;
 
 use std::collections::HashSet;
+use std::ops::AddAssign;
+use std::time::Duration;
 
 use bucket_sort::{bucket_sort, BucketSortOutput};
 use charabia::{Language, TokenizerBuilder};
 use db_cache::DatabaseCache;
+pub use distinct::{distinct_fid, distinct_single_docid};
 use exact_attribute::ExactAttribute;
 use graph_based_ranking_rule::{Exactness, Fid, Position, Proximity, Typo};
 use heed::RoTxn;
@@ -45,11 +48,11 @@ use sort::Sort;
 
 use self::distinct::facet_string_values;
 use self::geo_sort::GeoSort;
-pub use self::geo_sort::Parameter as GeoSortParameter;
-pub use self::geo_sort::Strategy as GeoSortStrategy;
+pub use self::geo_sort::{Parameter as GeoSortParameter, Strategy as GeoSortStrategy};
 use self::graph_based_ranking_rule::Words;
 use self::interner::Interned;
 use self::vector_sort::VectorSort;
+use crate::attribute_patterns::{match_pattern, PatternMatch};
 use crate::constants::RESERVED_GEO_FIELD_NAME;
 use crate::index::PrefixSearch;
 use crate::localized_attributes_rules::LocalizedFieldIds;
@@ -72,6 +75,7 @@ pub struct SearchContext<'ctx> {
     pub phrase_docids: PhraseDocIdsCache,
     pub restricted_fids: Option<RestrictedFids>,
     pub prefix_search: PrefixSearch,
+    pub vector_store_stats: Option<VectorStoreStats>,
 }
 
 impl<'ctx> SearchContext<'ctx> {
@@ -101,6 +105,7 @@ impl<'ctx> SearchContext<'ctx> {
             phrase_docids: <_>::default(),
             restricted_fids: None,
             prefix_search,
+            vector_store_stats: None,
         })
     }
 
@@ -116,17 +121,37 @@ impl<'ctx> SearchContext<'ctx> {
         let searchable_fields_weights = self.index.searchable_fields_and_weights(self.txn)?;
         let exact_attributes_ids = self.index.exact_attributes_ids(self.txn)?;
 
-        let mut wildcard = false;
+        let mut universal_wildcard = false;
 
         let mut restricted_fids = RestrictedFids::default();
         for field_name in attributes_to_search_on {
             if field_name == "*" {
-                wildcard = true;
+                universal_wildcard = true;
                 // we cannot early exit as we want to returns error in case of unknown fields
                 continue;
             }
             let searchable_weight =
                 searchable_fields_weights.iter().find(|(name, _, _)| name == field_name);
+
+            // The field is not searchable but may contain a wildcard pattern
+            if searchable_weight.is_none() && field_name.contains("*") {
+                let matching_searchable_weights: Vec<_> = searchable_fields_weights
+                    .iter()
+                    .filter(|(name, _, _)| match_pattern(field_name, name) == PatternMatch::Match)
+                    .collect();
+
+                if !matching_searchable_weights.is_empty() {
+                    for (_name, fid, weight) in matching_searchable_weights {
+                        if exact_attributes_ids.contains(fid) {
+                            restricted_fids.exact.push((*fid, *weight));
+                        } else {
+                            restricted_fids.tolerant.push((*fid, *weight));
+                        }
+                    }
+                    continue;
+                }
+            }
+
             let (fid, weight) = match searchable_weight {
                 // The Field id exist and the field is searchable
                 Some((_name, fid, weight)) => (*fid, *weight),
@@ -156,13 +181,32 @@ impl<'ctx> SearchContext<'ctx> {
             };
         }
 
-        if wildcard {
+        if universal_wildcard {
             self.restricted_fids = None;
         } else {
             self.restricted_fids = Some(restricted_fids);
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct VectorStoreStats {
+    /// The total time spent on vector search.
+    pub total_time: Duration,
+    /// The number of searches performed.
+    pub total_queries: usize,
+    /// The number of nearest neighbors found.
+    pub total_results: usize,
+}
+
+impl AddAssign for VectorStoreStats {
+    fn add_assign(&mut self, other: Self) {
+        let Self { total_time, total_queries, total_results } = self;
+        *total_time += other.total_time;
+        *total_queries += other.total_queries;
+        *total_results += other.total_results;
     }
 }
 
