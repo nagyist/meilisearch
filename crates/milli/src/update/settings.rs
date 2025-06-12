@@ -11,21 +11,23 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
 
+use super::chat::ChatSearchParams;
 use super::del_add::{DelAdd, DelAddOperation};
 use super::index_documents::{IndexDocumentsConfig, Transform};
-use super::IndexerConfig;
+use super::{ChatSettings, IndexerConfig};
 use crate::attribute_patterns::PatternMatch;
 use crate::constants::RESERVED_GEO_FIELD_NAME;
 use crate::criterion::Criterion;
-use crate::error::UserError;
+use crate::disabled_typos_terms::DisabledTyposTerms;
+use crate::error::UserError::{self, InvalidChatSettingsDocumentTemplateMaxBytes};
 use crate::fields_ids_map::metadata::{FieldIdMapWithMetadata, MetadataBuilder};
 use crate::filterable_attributes_rules::match_faceted_field;
 use crate::index::{
-    IndexEmbeddingConfig, PrefixSearch, DEFAULT_MIN_WORD_LEN_ONE_TYPO,
-    DEFAULT_MIN_WORD_LEN_TWO_TYPOS,
+    ChatConfig, IndexEmbeddingConfig, PrefixSearch, SearchParameters,
+    DEFAULT_MIN_WORD_LEN_ONE_TYPO, DEFAULT_MIN_WORD_LEN_TWO_TYPOS,
 };
 use crate::order_by_map::OrderByMap;
-use crate::prompt::default_max_bytes;
+use crate::prompt::{default_max_bytes, default_template_text, PromptData};
 use crate::proximity::ProximityPrecision;
 use crate::update::index_documents::IndexDocumentsMethod;
 use crate::update::{IndexDocuments, UpdateIndexingStep};
@@ -169,6 +171,7 @@ pub struct Settings<'a, 't, 'i> {
     synonyms: Setting<BTreeMap<String, Vec<String>>>,
     primary_key: Setting<String>,
     authorize_typos: Setting<bool>,
+    disable_on_numbers: Setting<bool>,
     min_word_len_two_typos: Setting<u8>,
     min_word_len_one_typo: Setting<u8>,
     exact_words: Setting<BTreeSet<String>>,
@@ -183,6 +186,7 @@ pub struct Settings<'a, 't, 'i> {
     localized_attributes_rules: Setting<Vec<LocalizedAttributesRule>>,
     prefix_search: Setting<PrefixSearch>,
     facet_search: Setting<bool>,
+    chat: Setting<ChatSettings>,
 }
 
 impl<'a, 't, 'i> Settings<'a, 't, 'i> {
@@ -207,6 +211,7 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
             synonyms: Setting::NotSet,
             primary_key: Setting::NotSet,
             authorize_typos: Setting::NotSet,
+            disable_on_numbers: Setting::NotSet,
             exact_words: Setting::NotSet,
             min_word_len_two_typos: Setting::NotSet,
             min_word_len_one_typo: Setting::NotSet,
@@ -220,6 +225,7 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
             localized_attributes_rules: Setting::NotSet,
             prefix_search: Setting::NotSet,
             facet_search: Setting::NotSet,
+            chat: Setting::NotSet,
             indexer_config,
         }
     }
@@ -330,7 +336,7 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
         self.primary_key = Setting::Set(primary_key);
     }
 
-    pub fn set_autorize_typos(&mut self, val: bool) {
+    pub fn set_authorize_typos(&mut self, val: bool) {
         self.authorize_typos = Setting::Set(val);
     }
 
@@ -352,6 +358,14 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
 
     pub fn reset_min_word_len_one_typo(&mut self) {
         self.min_word_len_one_typo = Setting::Reset;
+    }
+
+    pub fn set_disable_on_numbers(&mut self, disable_on_numbers: bool) {
+        self.disable_on_numbers = Setting::Set(disable_on_numbers);
+    }
+
+    pub fn reset_disable_on_numbers(&mut self) {
+        self.disable_on_numbers = Setting::Reset;
     }
 
     pub fn set_exact_words(&mut self, words: BTreeSet<String>) {
@@ -440,6 +454,14 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
 
     pub fn reset_facet_search(&mut self) {
         self.facet_search = Setting::Reset;
+    }
+
+    pub fn set_chat(&mut self, value: ChatSettings) {
+        self.chat = Setting::Set(value);
+    }
+
+    pub fn reset_chat(&mut self) {
+        self.chat = Setting::Reset;
     }
 
     #[tracing::instrument(
@@ -866,6 +888,23 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
         Ok(())
     }
 
+    fn update_disabled_typos_terms(&mut self) -> Result<()> {
+        let mut disabled_typos_terms = self.index.disabled_typos_terms(self.wtxn)?;
+        match self.disable_on_numbers {
+            Setting::Set(disable_on_numbers) => {
+                disabled_typos_terms.disable_on_numbers = disable_on_numbers;
+            }
+            Setting::Reset => {
+                disabled_typos_terms.disable_on_numbers =
+                    DisabledTyposTerms::default().disable_on_numbers;
+            }
+            Setting::NotSet => (),
+        }
+
+        self.index.put_disabled_typos_terms(self.wtxn, &disabled_typos_terms)?;
+        Ok(())
+    }
+
     fn update_exact_words(&mut self) -> Result<()> {
         match self.exact_words {
             Setting::Set(ref mut words) => {
@@ -1210,6 +1249,112 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
         Ok(())
     }
 
+    fn update_chat_config(&mut self) -> Result<bool> {
+        match &mut self.chat {
+            Setting::Set(ChatSettings {
+                description: new_description,
+                document_template: new_document_template,
+                document_template_max_bytes: new_document_template_max_bytes,
+                search_parameters: new_search_parameters,
+            }) => {
+                let ChatConfig { description, prompt, search_parameters } =
+                    self.index.chat_config(self.wtxn)?;
+
+                let description = match new_description {
+                    Setting::Set(new) => new.clone(),
+                    Setting::Reset => Default::default(),
+                    Setting::NotSet => description,
+                };
+
+                let prompt = PromptData {
+                    template: match new_document_template {
+                        Setting::Set(new) => new.clone(),
+                        Setting::Reset => default_template_text().to_string(),
+                        Setting::NotSet => prompt.template.clone(),
+                    },
+                    max_bytes: match new_document_template_max_bytes {
+                        Setting::Set(m) => Some(
+                            NonZeroUsize::new(*m)
+                                .ok_or(InvalidChatSettingsDocumentTemplateMaxBytes)?,
+                        ),
+                        Setting::Reset => Some(default_max_bytes()),
+                        Setting::NotSet => prompt.max_bytes,
+                    },
+                };
+
+                let search_parameters = match new_search_parameters {
+                    Setting::Set(sp) => {
+                        let ChatSearchParams {
+                            hybrid,
+                            limit,
+                            sort,
+                            distinct,
+                            matching_strategy,
+                            attributes_to_search_on,
+                            ranking_score_threshold,
+                        } = sp;
+
+                        SearchParameters {
+                            hybrid: match hybrid {
+                                Setting::Set(hybrid) => Some(crate::index::HybridQuery {
+                                    semantic_ratio: *hybrid.semantic_ratio,
+                                    embedder: hybrid.embedder.clone(),
+                                }),
+                                Setting::Reset => None,
+                                Setting::NotSet => search_parameters.hybrid.clone(),
+                            },
+                            limit: match limit {
+                                Setting::Set(limit) => Some(*limit),
+                                Setting::Reset => None,
+                                Setting::NotSet => search_parameters.limit,
+                            },
+                            sort: match sort {
+                                Setting::Set(sort) => Some(sort.clone()),
+                                Setting::Reset => None,
+                                Setting::NotSet => search_parameters.sort.clone(),
+                            },
+                            distinct: match distinct {
+                                Setting::Set(distinct) => Some(distinct.clone()),
+                                Setting::Reset => None,
+                                Setting::NotSet => search_parameters.distinct.clone(),
+                            },
+                            matching_strategy: match matching_strategy {
+                                Setting::Set(matching_strategy) => Some(*matching_strategy),
+                                Setting::Reset => None,
+                                Setting::NotSet => search_parameters.matching_strategy,
+                            },
+                            attributes_to_search_on: match attributes_to_search_on {
+                                Setting::Set(attributes_to_search_on) => {
+                                    Some(attributes_to_search_on.clone())
+                                }
+                                Setting::Reset => None,
+                                Setting::NotSet => {
+                                    search_parameters.attributes_to_search_on.clone()
+                                }
+                            },
+                            ranking_score_threshold: match ranking_score_threshold {
+                                Setting::Set(rst) => Some(*rst),
+                                Setting::Reset => None,
+                                Setting::NotSet => search_parameters.ranking_score_threshold,
+                            },
+                        }
+                    }
+                    Setting::Reset => Default::default(),
+                    Setting::NotSet => search_parameters,
+                };
+
+                self.index.put_chat_config(
+                    self.wtxn,
+                    &ChatConfig { description, prompt, search_parameters },
+                )?;
+
+                Ok(true)
+            }
+            Setting::Reset => self.index.delete_chat_config(self.wtxn).map_err(Into::into),
+            Setting::NotSet => Ok(false),
+        }
+    }
+
     pub fn execute<FP, FA>(mut self, progress_callback: FP, should_abort: FA) -> Result<()>
     where
         FP: Fn(UpdateIndexingStep) + Sync,
@@ -1246,6 +1391,8 @@ impl<'a, 't, 'i> Settings<'a, 't, 'i> {
         self.update_prefix_search()?;
         self.update_facet_search()?;
         self.update_localized_attributes_rules()?;
+        self.update_disabled_typos_terms()?;
+        self.update_chat_config()?;
 
         let embedding_config_updates = self.update_embedding_configs()?;
 
@@ -1327,6 +1474,7 @@ impl InnerIndexSettingsDiff {
                 || old_settings.prefix_search != new_settings.prefix_search
                 || old_settings.localized_attributes_rules
                     != new_settings.localized_attributes_rules
+                || old_settings.disabled_typos_terms != new_settings.disabled_typos_terms
         };
 
         let cache_exact_attributes = old_settings.exact_attributes != new_settings.exact_attributes;
@@ -1526,6 +1674,7 @@ pub(crate) struct InnerIndexSettings {
     pub user_defined_searchable_attributes: Option<Vec<String>>,
     pub sortable_fields: HashSet<String>,
     pub exact_attributes: HashSet<FieldId>,
+    pub disabled_typos_terms: DisabledTyposTerms,
     pub proximity_precision: ProximityPrecision,
     pub embedding_configs: EmbeddingConfigs,
     pub geo_fields_ids: Option<(FieldId, FieldId)>,
@@ -1574,7 +1723,7 @@ impl InnerIndexSettings {
             .map(|fields| fields.into_iter().map(|f| f.to_string()).collect());
         let builder = MetadataBuilder::from_index(index, rtxn)?;
         let fields_ids_map = FieldIdMapWithMetadata::new(fields_ids_map, builder);
-
+        let disabled_typos_terms = index.disabled_typos_terms(rtxn)?;
         Ok(Self {
             stop_words,
             allowed_separators,
@@ -1592,6 +1741,7 @@ impl InnerIndexSettings {
             geo_fields_ids,
             prefix_search,
             facet_search,
+            disabled_typos_terms,
         })
     }
 

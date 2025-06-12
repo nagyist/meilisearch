@@ -8,8 +8,10 @@ use std::str::FromStr;
 
 use deserr::{DeserializeError, Deserr, ErrorKind, MergeWithError, ValuePointerRef};
 use fst::IntoStreamer;
+use milli::disabled_typos_terms::DisabledTyposTerms;
 use milli::index::{IndexEmbeddingConfig, PrefixSearch};
 use milli::proximity::ProximityPrecision;
+pub use milli::update::ChatSettings;
 use milli::update::Setting;
 use milli::{Criterion, CriterionError, FilterableAttributesRule, Index, DEFAULT_VALUES_PER_FACET};
 use serde::{Deserialize, Serialize, Serializer};
@@ -104,6 +106,10 @@ pub struct TypoSettings {
     #[deserr(default)]
     #[schema(value_type = Option<BTreeSet<String>>, example = json!(["uuid", "url"]))]
     pub disable_on_attributes: Setting<BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "Setting::is_not_set")]
+    #[deserr(default)]
+    #[schema(value_type = Option<bool>, example = json!(true))]
+    pub disable_on_numbers: Setting<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Deserr, ToSchema)]
@@ -127,7 +133,7 @@ pub struct PaginationSettings {
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default)]
     #[schema(value_type = Option<usize>, example = json!(250))]
-    pub max_total_hits: Setting<usize>,
+    pub max_total_hits: Setting<NonZeroUsize>,
 }
 
 impl MergeWithError<milli::CriterionError> for DeserrJsonError<InvalidSettingsRankingRules> {
@@ -180,7 +186,7 @@ impl<E: DeserializeError> Deserr<E> for SettingEmbeddingSettings {
 /// Holds all the settings for an index. `T` can either be `Checked` if they represents settings
 /// whose validity is guaranteed, or `Unchecked` if they need to be validated. In the later case, a
 /// call to `check` will return a `Settings<Checked>` from a `Settings<Unchecked>`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Deserr, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Deserr, ToSchema)]
 #[serde(
     deny_unknown_fields,
     rename_all = "camelCase",
@@ -194,72 +200,86 @@ pub struct Settings<T> {
     #[deserr(default, error = DeserrJsonError<InvalidSettingsDisplayedAttributes>)]
     #[schema(value_type = Option<Vec<String>>, example = json!(["id", "title", "description", "url"]))]
     pub displayed_attributes: WildcardSetting,
+
     /// Fields in which to search for matching query words sorted by order of importance.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsSearchableAttributes>)]
     #[schema(value_type = Option<Vec<String>>, example = json!(["title", "description"]))]
     pub searchable_attributes: WildcardSetting,
+
     /// Attributes to use for faceting and filtering. See [Filtering and Faceted Search](https://www.meilisearch.com/docs/learn/filtering_and_sorting/search_with_facet_filters).
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsFilterableAttributes>)]
     #[schema(value_type = Option<Vec<FilterableAttributesRule>>, example = json!(["release_date", "genre"]))]
     pub filterable_attributes: Setting<Vec<FilterableAttributesRule>>,
+
     /// Attributes to use when sorting search results.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsSortableAttributes>)]
     #[schema(value_type = Option<Vec<String>>, example = json!(["release_date"]))]
     pub sortable_attributes: Setting<BTreeSet<String>>,
+
     /// List of ranking rules sorted by order of importance. The order is customizable.
     /// [A list of ordered built-in ranking rules](https://www.meilisearch.com/docs/learn/relevancy/relevancy).
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsRankingRules>)]
     #[schema(value_type = Option<Vec<String>>, example = json!([RankingRuleView::Words, RankingRuleView::Typo, RankingRuleView::Proximity, RankingRuleView::Attribute, RankingRuleView::Exactness]))]
     pub ranking_rules: Setting<Vec<RankingRuleView>>,
+
     /// List of words ignored when present in search queries.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsStopWords>)]
     #[schema(value_type = Option<Vec<String>>, example = json!(["the", "a", "them", "their"]))]
     pub stop_words: Setting<BTreeSet<String>>,
+
     /// List of characters not delimiting where one term begins and ends.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsNonSeparatorTokens>)]
     #[schema(value_type = Option<Vec<String>>, example = json!([" ", "\n"]))]
     pub non_separator_tokens: Setting<BTreeSet<String>>,
+
     /// List of characters delimiting where one term begins and ends.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsSeparatorTokens>)]
     #[schema(value_type = Option<Vec<String>>, example = json!(["S"]))]
     pub separator_tokens: Setting<BTreeSet<String>>,
+
     /// List of strings Meilisearch should parse as a single term.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsDictionary>)]
     #[schema(value_type = Option<Vec<String>>, example = json!(["iPhone pro"]))]
     pub dictionary: Setting<BTreeSet<String>>,
+
     /// List of associated words treated similarly. A word associated to an array of word as synonyms.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsSynonyms>)]
     #[schema(value_type = Option<BTreeMap<String, Vec<String>>>, example = json!({ "he": ["she", "they", "them"], "phone": ["iPhone", "android"]}))]
     pub synonyms: Setting<BTreeMap<String, Vec<String>>>,
+
     /// Search returns documents with distinct (different) values of the given field.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsDistinctAttribute>)]
     #[schema(value_type = Option<String>, example = json!("sku"))]
     pub distinct_attribute: Setting<String>,
+
     /// Precision level when calculating the proximity ranking rule.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsProximityPrecision>)]
     #[schema(value_type = Option<String>, example = json!(ProximityPrecisionView::ByAttribute))]
     pub proximity_precision: Setting<ProximityPrecisionView>,
+
     /// Customize typo tolerance feature.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsTypoTolerance>)]
     #[schema(value_type = Option<TypoSettings>, example = json!({ "enabled": true, "disableOnAttributes": ["title"]}))]
     pub typo_tolerance: Setting<TypoSettings>,
+
     /// Faceting settings.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsFaceting>)]
     #[schema(value_type = Option<FacetingSettings>, example = json!({ "maxValuesPerFacet": 10, "sortFacetValuesBy": { "genre": FacetValuesSort::Count }}))]
     pub faceting: Setting<FacetingSettings>,
+
     /// Pagination settings.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsPagination>)]
@@ -271,23 +291,33 @@ pub struct Settings<T> {
     #[deserr(default, error = DeserrJsonError<InvalidSettingsEmbedders>)]
     #[schema(value_type = Option<BTreeMap<String, SettingEmbeddingSettings>>)]
     pub embedders: Setting<BTreeMap<String, SettingEmbeddingSettings>>,
+
     /// Maximum duration of a search query.
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsSearchCutoffMs>)]
     #[schema(value_type = Option<u64>, example = json!(50))]
     pub search_cutoff_ms: Setting<u64>,
+
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsLocalizedAttributes>)]
     #[schema(value_type = Option<Vec<LocalizedAttributesRuleView>>, example = json!(50))]
     pub localized_attributes: Setting<Vec<LocalizedAttributesRuleView>>,
+
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsFacetSearch>)]
     #[schema(value_type = Option<bool>, example = json!(true))]
     pub facet_search: Setting<bool>,
+
     #[serde(default, skip_serializing_if = "Setting::is_not_set")]
     #[deserr(default, error = DeserrJsonError<InvalidSettingsPrefixSearch>)]
     #[schema(value_type = Option<PrefixSearchSettings>, example = json!("Hemlo"))]
     pub prefix_search: Setting<PrefixSearchSettings>,
+
+    /// Customize the chat prompting.
+    #[serde(default, skip_serializing_if = "Setting::is_not_set")]
+    #[deserr(default, error = DeserrJsonError<InvalidSettingsIndexChat>)]
+    #[schema(value_type = Option<ChatSettings>)]
+    pub chat: Setting<ChatSettings>,
 
     #[serde(skip)]
     #[deserr(skip)]
@@ -354,6 +384,7 @@ impl Settings<Checked> {
             localized_attributes: Setting::Reset,
             facet_search: Setting::Reset,
             prefix_search: Setting::Reset,
+            chat: Setting::Reset,
             _kind: PhantomData,
         }
     }
@@ -380,6 +411,7 @@ impl Settings<Checked> {
             localized_attributes: localized_attributes_rules,
             facet_search,
             prefix_search,
+            chat,
             _kind,
         } = self;
 
@@ -404,6 +436,7 @@ impl Settings<Checked> {
             localized_attributes: localized_attributes_rules,
             facet_search,
             prefix_search,
+            chat,
             _kind: PhantomData,
         }
     }
@@ -454,6 +487,7 @@ impl Settings<Unchecked> {
             localized_attributes: self.localized_attributes,
             facet_search: self.facet_search,
             prefix_search: self.prefix_search,
+            chat: self.chat,
             _kind: PhantomData,
         }
     }
@@ -528,8 +562,9 @@ impl Settings<Unchecked> {
                     Setting::Set(this)
                 }
             },
-            prefix_search: other.prefix_search.or(self.prefix_search),
             facet_search: other.facet_search.or(self.facet_search),
+            prefix_search: other.prefix_search.or(self.prefix_search),
+            chat: other.chat.clone().or(self.chat.clone()),
             _kind: PhantomData,
         }
     }
@@ -568,6 +603,7 @@ pub fn apply_settings_to_builder(
         localized_attributes: localized_attributes_rules,
         facet_search,
         prefix_search,
+        chat,
         _kind,
     } = settings;
 
@@ -661,7 +697,7 @@ pub fn apply_settings_to_builder(
     match typo_tolerance {
         Setting::Set(ref value) => {
             match value.enabled {
-                Setting::Set(val) => builder.set_autorize_typos(val),
+                Setting::Set(val) => builder.set_authorize_typos(val),
                 Setting::Reset => builder.reset_authorize_typos(),
                 Setting::NotSet => (),
             }
@@ -701,6 +737,12 @@ pub fn apply_settings_to_builder(
                 Setting::Reset => builder.reset_exact_attributes(),
                 Setting::NotSet => (),
             }
+
+            match value.disable_on_numbers {
+                Setting::Set(val) => builder.set_disable_on_numbers(val),
+                Setting::Reset => builder.reset_disable_on_numbers(),
+                Setting::NotSet => (),
+            }
         }
         Setting::Reset => {
             // all typo settings need to be reset here.
@@ -737,7 +779,7 @@ pub fn apply_settings_to_builder(
 
     match pagination {
         Setting::Set(ref value) => match value.max_total_hits {
-            Setting::Set(val) => builder.set_pagination_max_total_hits(val),
+            Setting::Set(val) => builder.set_pagination_max_total_hits(val.into()),
             Setting::Reset => builder.reset_pagination_max_total_hits(),
             Setting::NotSet => (),
         },
@@ -770,6 +812,12 @@ pub fn apply_settings_to_builder(
     match facet_search {
         Setting::Set(facet_search) => builder.set_facet_search(*facet_search),
         Setting::Reset => builder.reset_facet_search(),
+        Setting::NotSet => (),
+    }
+
+    match chat {
+        Setting::Set(chat) => builder.set_chat(chat.clone()),
+        Setting::Reset => builder.reset_chat(),
         Setting::NotSet => (),
     }
 }
@@ -826,12 +874,14 @@ pub fn settings(
     };
 
     let disabled_attributes = index.exact_attributes(rtxn)?.into_iter().map(String::from).collect();
+    let DisabledTyposTerms { disable_on_numbers } = index.disabled_typos_terms(rtxn)?;
 
     let typo_tolerance = TypoSettings {
         enabled: Setting::Set(index.authorize_typos(rtxn)?),
         min_word_size_for_typos: Setting::Set(min_typo_word_len),
         disable_on_words: Setting::Set(disabled_words),
         disable_on_attributes: Setting::Set(disabled_attributes),
+        disable_on_numbers: Setting::Set(disable_on_numbers),
     };
 
     let faceting = FacetingSettings {
@@ -854,8 +904,8 @@ pub fn settings(
         max_total_hits: Setting::Set(
             index
                 .pagination_max_total_hits(rtxn)?
-                .map(|x| x as usize)
-                .unwrap_or(DEFAULT_PAGINATION_MAX_TOTAL_HITS),
+                .and_then(|x| (x as usize).try_into().ok())
+                .unwrap_or(NonZeroUsize::new(DEFAULT_PAGINATION_MAX_TOTAL_HITS).unwrap()),
         ),
     };
 
@@ -867,14 +917,11 @@ pub fn settings(
         })
         .collect();
     let embedders = Setting::Set(embedders);
-
     let search_cutoff_ms = index.search_cutoff(rtxn)?;
-
     let localized_attributes_rules = index.localized_attributes_rules(rtxn)?;
-
     let prefix_search = index.prefix_search(rtxn)?.map(PrefixSearchSettings::from);
-
     let facet_search = index.facet_search(rtxn)?;
+    let chat = index.chat_config(rtxn).map(ChatSettings::from)?;
 
     let mut settings = Settings {
         displayed_attributes: match displayed_attributes {
@@ -912,8 +959,9 @@ pub fn settings(
             Some(rules) => Setting::Set(rules.into_iter().map(|r| r.into()).collect()),
             None => Setting::Reset,
         },
-        prefix_search: Setting::Set(prefix_search.unwrap_or_default()),
         facet_search: Setting::Set(facet_search),
+        prefix_search: Setting::Set(prefix_search.unwrap_or_default()),
+        chat: Setting::Set(chat),
         _kind: PhantomData,
     };
 
@@ -1141,6 +1189,7 @@ pub(crate) mod test {
             search_cutoff_ms: Setting::NotSet,
             facet_search: Setting::NotSet,
             prefix_search: Setting::NotSet,
+            chat: Setting::NotSet,
             _kind: PhantomData::<Unchecked>,
         };
 
@@ -1172,6 +1221,8 @@ pub(crate) mod test {
             search_cutoff_ms: Setting::NotSet,
             facet_search: Setting::NotSet,
             prefix_search: Setting::NotSet,
+            chat: Setting::NotSet,
+
             _kind: PhantomData::<Unchecked>,
         };
 
